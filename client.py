@@ -1,4 +1,3 @@
-
 import argparse
 import json
 import queue
@@ -10,6 +9,10 @@ import numpy as np
 import sounddevice as sd
 import webrtcvad
 import websocket
+
+# Ensure UTF-8 output (for Hangul etc.)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 SAMPLE_RATE = 16000
 FRAME_MS = 20
@@ -49,7 +52,6 @@ def run(ws_url: str, device: int | None, vad_level: int, silence_ms: int, langua
     silence_frames_needed = max(1, silence_ms // FRAME_MS)
     silence_count = 0
 
-    # Track how long we've been continuously voiced; force a cut when exceeded.
     voiced_ms = 0
     force_cut_enabled = max_segment_ms is not None and max_segment_ms > 0
 
@@ -69,21 +71,17 @@ def run(ws_url: str, device: int | None, vad_level: int, silence_ms: int, langua
                 ws.send(frame, opcode=websocket.ABNF.OPCODE_BINARY)
                 if not voiced:
                     voiced = True
-                    voiced_ms = 0  # start timing on speech onset
+                    voiced_ms = 0
                 else:
                     voiced_ms += FRAME_MS
 
-                # Time-based forced segmentation (no silence needed)
                 if force_cut_enabled and voiced_ms >= max_segment_ms:
                     try:
                         ws.send(json.dumps({"type": "segment_end"}))
-                        # Immediately start a new segment without dropping frames
                         voiced_ms = 0
-                        # Do NOT flip 'voiced' to False; we are still speaking
                     except websocket._exceptions.WebSocketConnectionClosedException:
                         print("\n[client] Server closed connection.")
                         break
-                # reset silence counter while speaking
                 silence_count = 0
 
             else:
@@ -99,20 +97,24 @@ def run(ws_url: str, device: int | None, vad_level: int, silence_ms: int, langua
                         silence_count = 0
                         voiced_ms = 0
 
-            # Non-blocking receive of server messages
             ws.settimeout(0.001)
             try:
                 msg = ws.recv()
                 if msg:
                     try:
                         data = json.loads(msg)
-                        if data.get("type") == "partial":
+                        t = data.get("type")
+                        if t == "partial":
                             current_line = data.get("agg") or data.get("text","")
                             print(f"\r[partial] {current_line[:120]:<120}", end="", flush=True)
-                        elif data.get("type") == "final":
+                        elif t == "final":
                             final_text = data.get("text","")
                             print(f"\n[final] {final_text}")
                             current_line = ""
+                        elif t == "mt":
+                            lang = data.get("lang","?")
+                            mt_text = data.get("text","")
+                            print(f"[mt:{lang}] {mt_text}")
                     except json.JSONDecodeError:
                         pass
             except websocket._exceptions.WebSocketTimeoutException:

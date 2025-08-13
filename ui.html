@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Live STT + MT Demo</title>
+<style>
+  :root { font-family: system-ui, Segoe UI, Roboto, Arial, "Noto Sans", sans-serif; }
+  body { margin: 24px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; min-width: 260px; flex: 1; }
+  .controls input[type="number"]{ width: 80px; }
+  .log { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Noto Sans Mono", monospace; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f1f1f1; margin-right:8px; font-size:12px; }
+  .final { margin: 6px 0; padding: 8px; border-left: 4px solid #3b82f6; background: #f3f8ff; border-radius: 6px; }
+  .mt    { margin: 4px 0 4px 16px; padding: 6px; border-left: 4px solid #10b981; background:#f3fcf7; border-radius: 6px; }
+  .muted { opacity:.7; }
+</style>
+</head>
+<body>
+  <h2>Live STT + MT (browser)</h2>
+
+  <div class="row controls">
+    <div class="card" style="max-width:620px">
+      <div style="margin-bottom:8px">
+        <label>WebSocket URL</label><br/>
+        <input id="wsUrl" style="width:100%" value="ws://127.0.0.1:8000/ws"/>
+      </div>
+      <div class="row">
+        <div>
+          <label>Silence end (ms)</label><br/>
+          <input id="silenceMs" type="number" value="300" min="100" step="50" />
+        </div>
+        <div>
+          <label>Max segment (ms)</label><br/>
+          <input id="maxSegMs" type="number" value="3500" min="0" step="100" />
+        </div>
+        <div>
+          <label>VAD threshold (dBFS)</label><br/>
+          <input id="vadDb" type="number" value="-50" step="1" />
+        </div>
+      </div>
+      <div style="margin-top:8px">
+        <button id="connectBtn">Connect</button>
+        <button id="startBtn" disabled>Start mic</button>
+        <button id="stopBtn"  disabled>Stop mic</button>
+        <button id="forceCutBtn" disabled>Force segment end</button>
+      </div>
+      <div style="margin-top:6px" class="muted">
+        Tip: this page sends 16 kHz mono int16 frames (~20 ms each) and uses a simple energy VAD + time-based cuts.
+      </div>
+    </div>
+
+    <div class="card" style="max-width:420px">
+      <div><span class="badge" id="wsState">WS: disconnected</span>
+           <span class="badge" id="micState">Mic: stopped</span></div>
+      <div class="muted" id="stats"></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="card" style="min-width:320px">
+      <h3>Live output</h3>
+      <div id="out" class="log"></div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const wsUrlEl     = document.getElementById('wsUrl');
+  const silenceMsEl = document.getElementById('silenceMs');
+  const maxSegMsEl  = document.getElementById('maxSegMs');
+  const vadDbEl     = document.getElementById('vadDb');
+  const outEl       = document.getElementById('out');
+  const wsStateEl   = document.getElementById('wsState');
+  const micStateEl  = document.getElementById('micState');
+  const statsEl     = document.getElementById('stats');
+
+  const connectBtn  = document.getElementById('connectBtn');
+  const startBtn    = document.getElementById('startBtn');
+  const stopBtn     = document.getElementById('stopBtn');
+  const forceCutBtn = document.getElementById('forceCutBtn');
+
+  let ws      = null;
+  let ac      = null;     // AudioContext
+  let node    = null;     // ScriptProcessorNode (simple and widely supported)
+  let source  = null;
+  let micStream = null;
+
+  // Streaming/endpointing state
+  const TARGET_SR = 16000;
+  const FRAME_SAMPLES = 320;           // 20 ms @ 16k
+  let downBuf = [];                    // Float32 queue (16k samples)
+  let voiced = false;
+  let silenceCount = 0;
+  let voicedMs = 0;
+  let lastFpsT = performance.now();
+  let framesSent = 0;
+
+  function logLine(html, cls='') {
+    const d = document.createElement('div');
+    d.className = cls;
+    d.innerHTML = html;
+    outEl.appendChild(d);
+    outEl.scrollTop = outEl.scrollHeight;
+  }
+
+  function setWsState(s){ wsStateEl.textContent = `WS: ${s}`; }
+  function setMicState(s){ micStateEl.textContent = `Mic: ${s}`; }
+
+  function rmsDbFS(arr){
+    let sum=0;
+    for(let i=0;i<arr.length;i++){ const v=arr[i]; sum += v*v; }
+    const rms = Math.sqrt(sum/Math.max(1,arr.length));
+    const db = 20*Math.log10(rms+1e-8);
+    return db; // 0 dBFS is full-scale
+  }
+
+  // Simple resampler 48k/44.1k -> 16k (linear)
+  function downsampleFloat32(input, inRate, outRate){
+    if (inRate === outRate) return Float32Array.from(input);
+    const ratio = inRate / outRate;
+    const outLen = Math.floor(input.length / ratio);
+    const out = new Float32Array(outLen);
+    let pos = 0;
+    for (let i=0; i<outLen; i++){
+      const idx = i * ratio;
+      const i0 = Math.floor(idx);
+      const i1 = Math.min(i0 + 1, input.length - 1);
+      const frac = idx - i0;
+      out[i] = input[i0] * (1-frac) + input[i1] * frac;
+    }
+    return out;
+  }
+
+  function floatTo16(leFloatArr){
+    const out = new Int16Array(leFloatArr.length);
+    for (let i=0; i<leFloatArr.length; i++){
+      let s = Math.max(-1, Math.min(1, leFloatArr[i]));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return new Uint8Array(out.buffer);
+  }
+
+  function sendFrame16k(samples16k){ // Float32 16k
+    // slice into 320-sample frames
+    for (let i=0; i<samples16k.length; i++){
+      downBuf.push(samples16k[i]);
+      if (downBuf.length >= FRAME_SAMPLES){
+        const frame = downBuf.splice(0, FRAME_SAMPLES);
+        if (ws && ws.readyState === WebSocket.OPEN){
+          ws.send(floatTo16(frame));
+          framesSent++;
+        }
+      }
+    }
+  }
+
+  function forceSegmentEnd(){
+    if (ws && ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify({type:"segment_end"}));
+    }
+  }
+
+  async function startMic(){
+    if (!ws || ws.readyState !== WebSocket.OPEN){
+      alert("Connect WebSocket first.");
+      return;
+    }
+    if (ac) return;
+    ac = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000});
+    micStream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, noiseSuppression: false, echoCancellation: false, autoGainControl: false}});
+    source = ac.createMediaStreamSource(micStream);
+
+    // ScriptProcessorNode is deprecated but still works everywhere; bufferSize 1024 gives ~21ms at 48k
+    node = ac.createScriptProcessor(1024, 1, 1);
+    node.onaudioprocess = (e) => {
+      const inBuf = e.inputBuffer.getChannelData(0);
+      // Energy VAD on the *input* block
+      const db = rmsDbFS(inBuf);
+      const vadThresh = parseFloat(vadDbEl.value || "-50");
+      const silenceFramesNeeded = Math.max(1, Math.floor((parseInt(silenceMsEl.value||"300")) / 20));
+      const maxSegMs = parseInt(maxSegMsEl.value || "3500");
+
+      if (db > vadThresh){
+        // speech frame
+        const ds = downsampleFloat32(inBuf, ac.sampleRate, TARGET_SR);
+        sendFrame16k(ds);
+
+        if (!voiced){ voiced = true; voicedMs = 0; }
+        else { voicedMs += 20; }
+        silenceCount = 0;
+
+        if (maxSegMs > 0 && voicedMs >= maxSegMs){
+          forceSegmentEnd();
+          voicedMs = 0; // continue with new chunk
+        }
+      } else {
+        // silence frame
+        if (voiced){
+          silenceCount++;
+          if (silenceCount >= silenceFramesNeeded){
+            forceSegmentEnd();
+            voiced = false;
+            silenceCount = 0;
+            voicedMs = 0;
+          }
+        }
+      }
+
+      // stats
+      const now = performance.now();
+      if (now - lastFpsT > 1000){
+        statsEl.textContent = `frames sent: ${framesSent} | level≈${db.toFixed(1)} dBFS`;
+        lastFpsT = now; framesSent = 0;
+      }
+
+      // pass-through
+      e.outputBuffer.getChannelData(0).fill(0);
+    };
+
+    source.connect(node);
+    node.connect(ac.destination);
+    setMicState("running");
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    forceCutBtn.disabled = false;
+  }
+
+  async function stopMic(){
+    if (node){ node.disconnect(); node = null; }
+    if (source){ source.disconnect(); source = null; }
+    if (micStream){ micStream.getTracks().forEach(t=>t.stop()); micStream = null; }
+    if (ac){ await ac.close(); ac = null; }
+    downBuf.length = 0;
+    setMicState("stopped");
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    forceCutBtn.disabled = true;
+  }
+
+  connectBtn.onclick = () => {
+    if (ws && ws.readyState === WebSocket.OPEN){
+      ws.close();
+      return;
+    }
+    ws = new WebSocket(wsUrlEl.value);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      setWsState("connected");
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      forceCutBtn.disabled = true;
+      // tell server we'd like ack (and it may reply with targets)
+      ws.send(JSON.stringify({type:"config", language:"en"}));
+    };
+    ws.onclose = () => {
+      setWsState("disconnected");
+      stopMic();
+    };
+    ws.onerror = (e) => {
+      setWsState("error");
+      console.error(e);
+    };
+    ws.onmessage = (evt) => {
+      try{
+        const data = JSON.parse(evt.data);
+        if (data.type === "final"){
+          logLine(`<div class="final">[final] ${escapeHtml(data.text || "")}</div>`);
+        } else if (data.type === "mt"){
+          const lang = data.lang || "?";
+          logLine(`<div class="mt">[mt:${lang}] ${escapeHtml(data.text || "")}</div>`);
+        } else if (data.type === "ack"){
+          const targets = (data.targets || []).join(", ");
+          if (targets) logLine(`<div class="muted">Targets: ${targets}</div>`);
+        }
+      } catch(_){}
+    };
+  };
+
+  startBtn.onclick = startMic;
+  stopBtn.onclick  = stopMic;
+  forceCutBtn.onclick = forceSegmentEnd;
+
+  function escapeHtml(s){
+    return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  }
+})();
+</script>
+</body>
+</html>
