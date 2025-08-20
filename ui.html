@@ -3,22 +3,24 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Live STT + MT Demo</title>
+<title>Live STT + MT :)</title>
 <style>
   :root { font-family: system-ui, Segoe UI, Roboto, Arial, "Noto Sans", sans-serif; }
   body { margin: 24px; }
   .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
-  .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; min-width: 260px; flex: 1; }
+  .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; min-width: 280px; flex: 1; }
   .controls input[type="number"]{ width: 80px; }
   .log { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Noto Sans Mono", monospace; }
   .badge { display:inline-block; padding:2px 8px; border-radius:999px; background:#f1f1f1; margin-right:8px; font-size:12px; }
   .final { margin: 6px 0; padding: 8px; border-left: 4px solid #3b82f6; background: #f3f8ff; border-radius: 6px; }
   .mt    { margin: 4px 0 4px 16px; padding: 6px; border-left: 4px solid #10b981; background:#f3fcf7; border-radius: 6px; }
   .muted { opacity:.7; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(120px,1fr)); gap:8px; }
+  .lang { padding:6px 8px; border:1px solid #eee; border-radius:8px; }
 </style>
 </head>
 <body>
-  <h2>Live STT + MT (browser)</h2>
+  <h2>Live STT + MT :)</h2>
 
   <div class="row controls">
     <div class="card" style="max-width:620px">
@@ -37,7 +39,7 @@
         </div>
         <div>
           <label>VAD threshold (dBFS)</label><br/>
-          <input id="vadDb" type="number" value="-50" step="1" />
+          <input id="vadDb" type="number" value="-40" step="1" />
         </div>
       </div>
       <div style="margin-top:8px">
@@ -47,11 +49,11 @@
         <button id="forceCutBtn" disabled>Force segment end</button>
       </div>
       <div style="margin-top:6px" class="muted">
-        Tip: this page sends 16 kHz mono int16 frames (~20 ms each) and uses a simple energy VAD + time-based cuts.
+        Streams 16 kHz mono int16 frames (~20 ms). Energy VAD + time-based cuts.
       </div>
     </div>
 
-    <div class="card" style="max-width:420px">
+    <div class="card">
       <div><span class="badge" id="wsState">WS: disconnected</span>
            <span class="badge" id="micState">Mic: stopped</span></div>
       <div class="muted" id="stats"></div>
@@ -59,6 +61,17 @@
   </div>
 
   <div class="row">
+    <div class="card" style="min-width:320px">
+      <h3>Languages</h3>
+      <div class="grid" id="langGrid"></div>
+      <div style="margin-top:8px">
+        <button id="applyLangsBtn">Apply to server</button>
+        <button id="selectTopBtn" class="muted">Select popular 30</button>
+        <button id="clearLangsBtn" class="muted">Clear</button>
+      </div>
+      <div class="muted" id="langInfo"></div>
+    </div>
+
     <div class="card" style="min-width:320px">
       <h3>Live output</h3>
       <div id="out" class="log"></div>
@@ -75,22 +88,91 @@
   const wsStateEl   = document.getElementById('wsState');
   const micStateEl  = document.getElementById('micState');
   const statsEl     = document.getElementById('stats');
+  const langGrid    = document.getElementById('langGrid');
+  const langInfo    = document.getElementById('langInfo');
 
   const connectBtn  = document.getElementById('connectBtn');
   const startBtn    = document.getElementById('startBtn');
   const stopBtn     = document.getElementById('stopBtn');
   const forceCutBtn = document.getElementById('forceCutBtn');
+  const applyLangsBtn = document.getElementById('applyLangsBtn');
+  const selectTopBtn  = document.getElementById('selectTopBtn');
+  const clearLangsBtn = document.getElementById('clearLangsBtn');
+
+  // Your 5 + ~25 widely used (M2M100-supported) languages
+  const LANGS = [
+    {code:'fr', name:'French'}, {code:'es', name:'Spanish'}, {code:'de', name:'German'},
+    {code:'lt', name:'Lithuanian'}, {code:'ko', name:'Korean'},
+    {code:'zh', name:'Chinese'}, {code:'ja', name:'Japanese'}, {code:'ru', name:'Russian'},
+    {code:'ar', name:'Arabic'}, {code:'hi', name:'Hindi'}, {code:'pt', name:'Portuguese'},
+    {code:'it', name:'Italian'}, {code:'tr', name:'Turkish'}, {code:'pl', name:'Polish'},
+    {code:'nl', name:'Dutch'}, {code:'sv', name:'Swedish'}, {code:'da', name:'Danish'},
+    {code:'fi', name:'Finnish'}, {code:'no', name:'Norwegian'}, {code:'el', name:'Greek'},
+    {code:'cs', name:'Czech'}, {code:'uk', name:'Ukrainian'}, {code:'he', name:'Hebrew'},
+    {code:'th', name:'Thai'}, {code:'vi', name:'Vietnamese'}, {code:'id', name:'Indonesian'},
+    {code:'ms', name:'Malay'}, {code:'ro', name:'Romanian'}, {code:'bg', name:'Bulgarian'},
+    {code:'hu', name:'Hungarian'}
+  ];
+  const DEFAULT5 = ['fr','es','de','lt','ko'];
+
+  // Auto-pick the correct WS URL for this host (works on ngrok, Cloudflare, localhost)
+  window.addEventListener('DOMContentLoaded', () => {
+    const wsEl = document.getElementById('wsUrl');
+    const isHttps = location.protocol === 'https:';
+    const defaultWsUrl = (isHttps ? 'wss://' : 'ws://') + location.host + '/ws';
+
+    // If empty or looks like a localhost leftover, replace it
+    if (!wsEl.value || /127\.0\.0\.1|localhost/.test(wsEl.value)) {
+      wsEl.value = defaultWsUrl;
+    }
+
+    // If page is https and the field accidentally has ws://, upgrade it to wss://
+    if (isHttps && wsEl.value.startsWith('ws://')) {
+      wsEl.value = wsEl.value.replace('ws://', 'wss://');
+    }
+  });
+
+  function renderLangs(selected = new Set(DEFAULT5)){
+    langGrid.innerHTML = '';
+    LANGS.forEach(({code, name}) => {
+      const id = `lang-${code}`;
+      const wrap = document.createElement('label');
+      wrap.className = 'lang';
+      wrap.innerHTML = `<input type="checkbox" id="${id}" value="${code}" ${selected.has(code)?'checked':''}/> ${name} <span class="muted">(${code})</span>`;
+      langGrid.appendChild(wrap);
+    });
+    updateLangInfo();
+  }
+
+  function getSelectedLangs(){
+    return Array.from(langGrid.querySelectorAll('input[type=checkbox]:checked')).map(el => el.value);
+  }
+
+  function setSelectedLangs(codes){
+    const set = new Set(codes);
+    Array.from(langGrid.querySelectorAll('input[type=checkbox]')).forEach(el => {
+      el.checked = set.has(el.value);
+    });
+    updateLangInfo();
+  }
+
+  function updateLangInfo(){
+    const list = getSelectedLangs();
+    langInfo.textContent = list.length ? `Selected: ${list.join(', ')}` : 'No languages selected.';
+  }
+
+  renderLangs();
 
   let ws      = null;
-  let ac      = null;     // AudioContext
-  let node    = null;     // ScriptProcessorNode (simple and widely supported)
+  let ac      = null;
+  let node    = null;
   let source  = null;
   let micStream = null;
 
   // Streaming/endpointing state
   const TARGET_SR = 16000;
   const FRAME_SAMPLES = 320;           // 20 ms @ 16k
-  let downBuf = [];                    // Float32 queue (16k samples)
+  let downBuf = [];
   let voiced = false;
   let silenceCount = 0;
   let voicedMs = 0;
@@ -109,20 +191,15 @@
   function setMicState(s){ micStateEl.textContent = `Mic: ${s}`; }
 
   function rmsDbFS(arr){
-    let sum=0;
-    for(let i=0;i<arr.length;i++){ const v=arr[i]; sum += v*v; }
-    const rms = Math.sqrt(sum/Math.max(1,arr.length));
-    const db = 20*Math.log10(rms+1e-8);
-    return db; // 0 dBFS is full-scale
+    let sum=0; for(let i=0;i<arr.length;i++){ const v=arr[i]; sum += v*v; }
+    return 20*Math.log10(Math.sqrt(sum/Math.max(1,arr.length))+1e-8);
   }
 
-  // Simple resampler 48k/44.1k -> 16k (linear)
   function downsampleFloat32(input, inRate, outRate){
     if (inRate === outRate) return Float32Array.from(input);
     const ratio = inRate / outRate;
     const outLen = Math.floor(input.length / ratio);
     const out = new Float32Array(outLen);
-    let pos = 0;
     for (let i=0; i<outLen; i++){
       const idx = i * ratio;
       const i0 = Math.floor(idx);
@@ -133,18 +210,17 @@
     return out;
   }
 
-  function floatTo16(leFloatArr){
-    const out = new Int16Array(leFloatArr.length);
-    for (let i=0; i<leFloatArr.length; i++){
-      let s = Math.max(-1, Math.min(1, leFloatArr[i]));
+  function floatTo16(f32){
+    const out = new Int16Array(f32.length);
+    for (let i=0;i<f32.length;i++){
+      let s = Math.max(-1, Math.min(1, f32[i]));
       out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
     return new Uint8Array(out.buffer);
   }
 
-  function sendFrame16k(samples16k){ // Float32 16k
-    // slice into 320-sample frames
-    for (let i=0; i<samples16k.length; i++){
+  function sendFrame16k(samples16k){
+    for (let i=0;i<samples16k.length;i++){
       downBuf.push(samples16k[i]);
       if (downBuf.length >= FRAME_SAMPLES){
         const frame = downBuf.splice(0, FRAME_SAMPLES);
@@ -162,69 +238,59 @@
     }
   }
 
-  async function startMic(){
-    if (!ws || ws.readyState !== WebSocket.OPEN){
+  function applyLanguages(){
+    const langs = getSelectedLangs();
+    const payload = {type:"config", language:"en", targets: langs};
+    if (ws && ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify(payload));
+      localStorage.setItem("langs", JSON.stringify(langs));
+    } else {
       alert("Connect WebSocket first.");
-      return;
     }
+  }
+
+  async function startMic(){
+    if (!ws || ws.readyState !== WebSocket.OPEN){ alert("Connect WebSocket first."); return; }
     if (ac) return;
     ac = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000});
     micStream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, noiseSuppression: false, echoCancellation: false, autoGainControl: false}});
     source = ac.createMediaStreamSource(micStream);
-
-    // ScriptProcessorNode is deprecated but still works everywhere; bufferSize 1024 gives ~21ms at 48k
     node = ac.createScriptProcessor(1024, 1, 1);
     node.onaudioprocess = (e) => {
       const inBuf = e.inputBuffer.getChannelData(0);
-      // Energy VAD on the *input* block
       const db = rmsDbFS(inBuf);
-      const vadThresh = parseFloat(vadDbEl.value || "-50");
-      const silenceFramesNeeded = Math.max(1, Math.floor((parseInt(silenceMsEl.value||"300")) / 20));
-      const maxSegMs = parseInt(maxSegMsEl.value || "3500");
+      const vadThresh = parseFloat(vadDbEl.value || "-55");
+      const silenceFramesNeeded = Math.max(1, Math.floor((parseInt(silenceMsEl.value||"500")) / 20));
+      const maxSegMs = parseInt(maxSegMsEl.value || "5000");
 
       if (db > vadThresh){
-        // speech frame
         const ds = downsampleFloat32(inBuf, ac.sampleRate, TARGET_SR);
         sendFrame16k(ds);
-
-        if (!voiced){ voiced = true; voicedMs = 0; }
-        else { voicedMs += 20; }
+        if (!voiced){ voiced = true; voicedMs = 0; } else { voicedMs += 20; }
         silenceCount = 0;
-
         if (maxSegMs > 0 && voicedMs >= maxSegMs){
-          forceSegmentEnd();
-          voicedMs = 0; // continue with new chunk
+          forceSegmentEnd(); voicedMs = 0;
         }
       } else {
-        // silence frame
         if (voiced){
           silenceCount++;
           if (silenceCount >= silenceFramesNeeded){
-            forceSegmentEnd();
-            voiced = false;
-            silenceCount = 0;
-            voicedMs = 0;
+            forceSegmentEnd(); voiced = false; silenceCount = 0; voicedMs = 0;
           }
         }
       }
 
-      // stats
       const now = performance.now();
       if (now - lastFpsT > 1000){
         statsEl.textContent = `frames sent: ${framesSent} | level≈${db.toFixed(1)} dBFS`;
         lastFpsT = now; framesSent = 0;
       }
-
-      // pass-through
       e.outputBuffer.getChannelData(0).fill(0);
     };
-
     source.connect(node);
     node.connect(ac.destination);
     setMicState("running");
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
-    forceCutBtn.disabled = false;
+    startBtn.disabled = true; stopBtn.disabled = false; forceCutBtn.disabled = false;
   }
 
   async function stopMic(){
@@ -234,34 +300,37 @@
     if (ac){ await ac.close(); ac = null; }
     downBuf.length = 0;
     setMicState("stopped");
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-    forceCutBtn.disabled = true;
+    startBtn.disabled = false; stopBtn.disabled = true; forceCutBtn.disabled = true;
   }
 
+  // Buttons
   connectBtn.onclick = () => {
-    if (ws && ws.readyState === WebSocket.OPEN){
-      ws.close();
-      return;
-    }
+    if (ws && ws.readyState === WebSocket.OPEN){ ws.close(); return; }
+    
+    // Build from field or default
+    const isHttps = location.protocol === 'https:';
+    const defaultWsUrl = (isHttps ? 'wss://' : 'ws://') + location.host + '/ws';
+    let base = (wsUrlEl.value || '').trim() || defaultWsUrl;
+    if (isHttps && base.startsWith('ws://')) base = base.replace('ws://', 'wss://');
+
+    // Optional token support
+    const tokenEl = document.getElementById('token');
+    const token = tokenEl ? (tokenEl.value || '').trim() : '';
+    const url = token ? `${base}${base.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : base;
+
     ws = new WebSocket(wsUrlEl.value);
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
       setWsState("connected");
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-      forceCutBtn.disabled = true;
-      // tell server we'd like ack (and it may reply with targets)
-      ws.send(JSON.stringify({type:"config", language:"en"}));
+      startBtn.disabled = false; stopBtn.disabled = true; forceCutBtn.disabled = true;
+
+      // restore saved langs and send immediately
+      const saved = JSON.parse(localStorage.getItem("langs") || "null");
+      if (saved && Array.isArray(saved) && saved.length){ setSelectedLangs(saved); }
+      applyLanguages();
     };
-    ws.onclose = () => {
-      setWsState("disconnected");
-      stopMic();
-    };
-    ws.onerror = (e) => {
-      setWsState("error");
-      console.error(e);
-    };
+    ws.onclose = () => { setWsState("disconnected"); stopMic(); };
+    ws.onerror = (e) => { setWsState("error"); console.error(e); };
     ws.onmessage = (evt) => {
       try{
         const data = JSON.parse(evt.data);
@@ -271,20 +340,22 @@
           const lang = data.lang || "?";
           logLine(`<div class="mt">[mt:${lang}] ${escapeHtml(data.text || "")}</div>`);
         } else if (data.type === "ack"){
-          const targets = (data.targets || []).join(", ");
-          if (targets) logLine(`<div class="muted">Targets: ${targets}</div>`);
+          const t = (data.targets || []).join(", ");
+          const u = (data.unsupported || []).join(", ");
+          if (t) logLine(`<div class="muted">Targets: ${t}${u ? " | unsupported: " + u : ""}</div>`);
         }
       } catch(_){}
     };
   };
 
-  startBtn.onclick = startMic;
-  stopBtn.onclick  = stopMic;
-  forceCutBtn.onclick = forceSegmentEnd;
+  document.getElementById('startBtn').onclick = startMic;
+  document.getElementById('stopBtn').onclick  = stopMic;
+  document.getElementById('forceCutBtn').onclick = forceSegmentEnd;
+  document.getElementById('applyLangsBtn').onclick = applyLanguages;
+  document.getElementById('selectTopBtn').onclick = () => setSelectedLangs(LANGS.map(x=>x.code));
+  document.getElementById('clearLangsBtn').onclick = () => setSelectedLangs([]);
 
-  function escapeHtml(s){
-    return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-  }
+  function escapeHtml(s){ return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 })();
 </script>
 </body>

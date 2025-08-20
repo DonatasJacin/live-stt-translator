@@ -1,19 +1,52 @@
 import os
 import json
 import re
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
+from fastapi.staticfiles import StaticFiles
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
+from fastapi.responses import RedirectResponse 
 
 import sherpa_onnx
 import ctranslate2
 from transformers import AutoTokenizer
 
+from datetime import datetime
+from fastapi.staticfiles import StaticFiles
+import pathlib, uuid
+
+
+# --- Logging ---
+LOG_DIR = os.getenv("LOG_DIR", os.path.join(os.getcwd(), "logs"))
+LOG_ENABLE = os.getenv("LOG_ENABLE", "1") != "0"
+os.makedirs(LOG_DIR, exist_ok=True)
+
+def _ts():
+    return datetime.utcnow().isoformat(timespec="milliseconds") + "Z"
+
+def _new_log(session_hint: str | None = None):
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", (session_hint or "session")).strip("-") or "session"
+    name = f"{ts}_{safe}_{uuid.uuid4().hex[:6]}.ndjson"
+    path = os.path.join(LOG_DIR, name)
+    f = open(path, "a", encoding="utf-8")
+    return f, path
+
+def _log_event(logf, obj: dict):
+    if not logf:
+        return
+    obj = dict(obj)
+    obj["ts"] = _ts()
+    logf.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    logf.flush()
+
+
 # ---------------- STT (Parakeet) config ----------------
 SAMPLE_RATE = 16000
 FEATURE_DIM = 80
+MIN_SAMPLES_FOR_DECODE = int(os.getenv("MIN_SAMPLES_FOR_DECODE", "300"))  # ~50 ms @ 16k
 CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", str(os.cpu_count() or 4)))
 PARAKEET_DIR = os.getenv(
     "PARAKEET_DIR",
@@ -33,9 +66,9 @@ FILLER_SET = {
 }
 
 # ---------------- MT (M2M100 via CTranslate2) ----------------
-# ISO 639-1 codes, comma-separated (e.g., "fr,es,de,lt,ko")
-TARGET_LANGS = [s.strip() for s in os.getenv("TARGET_LANGS", "fr,es,de").split(",") if s.strip()]
-MT_DIR = os.getenv("MT_MODEL_DIR", os.path.join(os.getcwd(), "m2m100_418_ct2"))  # CTranslate2 model dir
+# Default targets (used if the client doesn't override); you can keep your existing env if you like.
+DEFAULT_TARGET_LANGS = [s.strip() for s in os.getenv("TARGET_LANGS", "fr,es,de,lt,ko").split(",") if s.strip()]
+MT_DIR = os.getenv("MT_MODEL_DIR", os.path.join(os.getcwd(), "m2m100_418_ct2"))
 MT_BEAM_SIZE = int(os.getenv("MT_BEAM_SIZE", "4"))
 
 def _abspath(p: str) -> str:
@@ -125,12 +158,21 @@ translator = ctranslate2.Translator(
 tokenizer = AutoTokenizer.from_pretrained("facebook/m2m100_418M")
 tokenizer.src_lang = "en"  # ASR source language
 
+def _normalize_targets(codes: List[str]) -> Tuple[List[str], List[str]]:
+    ok, bad = [], []
+    for c in codes:
+        try:
+            _ = tokenizer.get_lang_id(c)
+            ok.append(c)
+        except KeyError:
+            bad.append(c)
+    return ok, bad
+
 def translate_all(text: str, targets: List[str]) -> Dict[str, str]:
     # Encode with src_lang so the input contains the proper >>en<< token
-    enc = tokenizer(text, return_tensors="pt")  # add_special_tokens=True (default)
+    enc = tokenizer(text, return_tensors="pt")
     src_tokens = tokenizer.convert_ids_to_tokens(enc["input_ids"][0])
 
-    # Build per-target language prefixes as token *strings*
     prefixes = []
     tlangs = []
     for t in targets:
@@ -145,34 +187,50 @@ def translate_all(text: str, targets: List[str]) -> Dict[str, str]:
     if not prefixes:
         return {}
 
-    # Repeat the same source tokens per target and translate
     batch = [src_tokens for _ in prefixes]
     results = translator.translate_batch(batch, target_prefix=prefixes, beam_size=MT_BEAM_SIZE)
 
     out: Dict[str, str] = {}
     for t, res in zip(tlangs, results):
         hyp = res.hypotheses[0] if res.hypotheses else []
-        # First generated token is the target language tag; drop it
-        toks = hyp[1:] if hyp else []
+        toks = hyp[1:] if hyp else []  # drop generated lang tag
         out[t] = tokenizer.decode(tokenizer.convert_tokens_to_ids(toks), skip_special_tokens=True)
     return out
 
-
 # ---------------- App ----------------
 app = FastAPI()
+app.mount("/app", StaticFiles(directory=os.getcwd()), name="app")
+# Browse/download logs at /logs/
+app.mount("/logs", StaticFiles(directory=LOG_DIR), name="logs")
+
+@app.get("/", include_in_schema=False)
+def index():
+    return RedirectResponse(url="/app/ui.html", status_code=307)
 
 @app.get("/", response_class=PlainTextResponse)
 def root():
-    langs = ",".join(TARGET_LANGS) or "(none)"
-    return f"Live STT+MT is up. Targets: {langs}. Connect a WebSocket client to /ws"
+    langs = ",".join(DEFAULT_TARGET_LANGS) or "(none)"
+    return f"Live STT+MT is up. Default targets: {langs}. Connect a WebSocket client to /ws"
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    # Logging per-connection
+    logf = None
+    segment_id = 1
+    session_label = None
+    if LOG_ENABLE:
+        logf, log_path = _new_log()   # provisional name; we may reopen when we learn the session
+        print(f"[server-mt] Logging to {log_path}")
+        _log_event(logf, {"type": "start", "note": "connection opened"})
+
     print("[server-mt] Client connected.")
 
     utt_pcm = bytearray()
     seconds_accum = 0.0
+
+    # Per-connection targets (start with default, override via config)
+    targets = list(DEFAULT_TARGET_LANGS)
 
     try:
         while True:
@@ -185,19 +243,29 @@ async def ws_endpoint(ws: WebSocket):
 
                 # Time cap (finalize even without silence)
                 if MAX_UTTERANCE_SEC > 0 and seconds_accum >= MAX_UTTERANCE_SEC:
-                    audio = _int16_bytes_to_float32_numpy(bytes(utt_pcm))
-                    stream = recognizer.create_stream()
-                    stream.accept_waveform(SAMPLE_RATE, audio)
-                    recognizer.decode_stream(stream)
-                    text = (stream.result.text or "").strip()
+                    if len(utt_pcm) >= MIN_SAMPLES_FOR_DECODE:
+                        audio = _int16_bytes_to_float32_numpy(bytes(utt_pcm))
+                        stream = recognizer.create_stream()
+                        stream.accept_waveform(SAMPLE_RATE, audio)
+                        try:
+                            recognizer.decode_stream(stream)
+                            text = (stream.result.text or "").strip()
+                            if not _should_suppress(text, seconds_accum):
+                                await ws.send_json({"type": "final", "text": text})
+                                _log_event(logf, {"type": "final", "segment": segment_id, "text": text})
 
-                    if not _should_suppress(text, seconds_accum):
-                        await ws.send_json({"type": "final", "text": text})
-                        if TARGET_LANGS:
-                            mts = translate_all(text, TARGET_LANGS)
-                            for lang, mt in mts.items():
-                                await ws.send_json({"type": "mt", "lang": lang, "text": mt, "src": text})
-
+                                if targets:
+                                    mts = translate_all(text, targets)
+                                    for lang, mt in mts.items():
+                                        await ws.send_json({"type": "mt", "lang": lang, "text": mt, "src": text})
+                                        _log_event(logf, {
+                                            "type": "mt", "segment": segment_id,
+                                            "lang": lang, "text": mt, "src": text
+                                        })
+                                segment_id += 1
+                        except Exception as e:
+                            print(f"[server-mt] Decode error (time-cap): {e}")
+                    # reset either way
                     utt_pcm.clear()
                     seconds_accum = 0.0
 
@@ -208,30 +276,73 @@ async def ws_endpoint(ws: WebSocket):
                     evt = {}
 
                 if evt.get("type") == "config":
-                    await ws.send_json({"type": "ack", "targets": TARGET_LANGS})
+                    # allow client to set targets (existing code) ...
+                    req_targets = evt.get("targets")
+                    if isinstance(req_targets, list) and req_targets:
+                        ok, bad = _normalize_targets([str(x).strip() for x in req_targets])
+                        if ok:
+                            targets = ok
+                        ack = {"type": "ack", "targets": targets, "unsupported": bad}
+                    else:
+                        ack = {"type": "ack", "targets": targets}
+
+                    # session label for nicer log filename
+                    sess = evt.get("session")
+                    if sess and LOG_ENABLE:
+                        session_label = str(sess)
+                        try:
+                            # reopen log with a better name
+                            if logf:
+                                logf.close()
+                            logf, log_path = _new_log(session_label)
+                            print(f"[server-mt] Logging to {log_path}")
+                            _log_event(logf, {"type": "session", "session": session_label})
+                        except Exception as e:
+                            print(f"[server-mt] Could not reopen log: {e}")
+
+                    await ws.send_json(ack)
+                    _log_event(logf, {"type": "ack", **ack})
+
 
                 if evt.get("type") == "segment_end":
-                    audio = _int16_bytes_to_float32_numpy(bytes(utt_pcm))
-                    stream = recognizer.create_stream()
-                    stream.accept_waveform(SAMPLE_RATE, audio)
-                    recognizer.decode_stream(stream)
-                    text = (stream.result.text or "").strip()
+                    if len(utt_pcm) >= MIN_SAMPLES_FOR_DECODE:
+                        audio = _int16_bytes_to_float32_numpy(bytes(utt_pcm))
+                        stream = recognizer.create_stream()
+                        stream.accept_waveform(SAMPLE_RATE, audio)
+                        try:
+                            recognizer.decode_stream(stream)
+                            text = (stream.result.text or "").strip()
+                            if not _should_suppress(text, seconds_accum):
+                                await ws.send_json({"type": "final", "text": text})
+                                _log_event(logf, {"type": "final", "segment": segment_id, "text": text})
 
-                    if not _should_suppress(text, seconds_accum):
-                        await ws.send_json({"type": "final", "text": text})
-                        if TARGET_LANGS:
-                            mts = translate_all(text, TARGET_LANGS)
-                            for lang, mt in mts.items():
-                                await ws.send_json({"type": "mt", "lang": lang, "text": mt, "src": text})
-
+                                if targets:
+                                    mts = translate_all(text, targets)
+                                    for lang, mt in mts.items():
+                                        await ws.send_json({"type": "mt", "lang": lang, "text": mt, "src": text})
+                                        _log_event(logf, {
+                                            "type": "mt", "segment": segment_id,
+                                            "lang": lang, "text": mt, "src": text
+                                        })
+                                segment_id += 1
+                        except Exception as e:
+                            print(f"[server-mt] Decode error (segment_end): {e}")
+                    # reset either way
                     utt_pcm.clear()
                     seconds_accum = 0.0
 
+
     except WebSocketDisconnect:
         print("[server-mt] Client disconnected.")
+        _log_event(logf, {"type": "end", "reason": "client disconnect"})
     except Exception as e:
         print(f"[server-mt] Error: {e}")
+        _log_event(logf, {"type": "end", "reason": f"error: {e}"})
         try:
             await ws.close()
         except Exception:
             pass
+    finally:
+        if logf:
+            logf.close()
+
